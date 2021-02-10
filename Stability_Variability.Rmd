@@ -1,0 +1,402 @@
+---
+title: "Interday Stability and Intraday Variability"
+author: "Jade Benson"
+date: "2/8/2021"
+output: 
+  pdf_document:
+    latex_engine: xelatex 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#set up necessary packages 
+library(tidyverse) #for all the dataset work
+library(tidymodels)
+library(here) #possibly for file paths
+library(foreign) #convert foreign files (stata)
+library(haven) #actually needed haven for older stata files 
+library(data.table) #to create data tables with IS and IV data
+library(stringi) #extract strings from datetime 
+library(ggplot2) #graphing
+
+```
+
+#Interday Stability
+
+Measures how stable rhythm is over the study window; how similar are the individual’s day-night patterns. Calculated by taking the variance of each hour around its mean for the three days.
+
+![Interday Stability formula.](C:/Users/Jade/Documents/Sleep Mortality/IS_formula.png)
+Where: 
+	$n$ = total number of data 
+	$p$ = number of data per day (24) 
+	$x_h$ = hourly means
+	$\bar{X}$ = mean of all data
+	$x_i$ = individual data points 
+	
+#Intraday Variability 
+Measures how fragmented the rhythm is throughout the study window; what is the rate of shifting between rest and activity (within days). Calculated by taking the difference of lagged hour points and dividing by the overall variance. 
+
+![Intraday Variability formula.](C:/Users/Jade/Documents/Sleep Mortality/IV_formula.png)
+Where: 
+  $n$ = total number of data 
+	$p$ = number of data per day (24) 
+	$\bar{X}$ = mean of all data
+	$x_i$ = individual data points
+	$x_{i-1}$ = data points from the hour prior
+
+
+#Data Preparation
+Now I will walk through the steps to calculate these two measures to help with replicability and transparency. The code will be useful for debugging/double-checking - but visuals and other data checks will be performed throughout to be interpretable. 
+
+Start with the data cleaning. Create actigraphy record with the relevant su_ids that have the full three nights of actigraphy and subset all records down to only 72hr. In this version, I'm keeping the missing values (NOT recoding to 0) and I'm not running the change point analysis to pick up any patterns of off wrist time (since we're subsetting to first 72hr). However, there were a few cases where the initial period didn't have much data so we might have to revisit this if we want to use the change point analysis in our subsetting to pick a representative sample of actigraphy. 
+
+```{r data-clean}
+#read in the data 
+actigraphy <- read_dta("C:/Users/Jade/Documents/W2_Actigraphy/activity.dta")
+
+#check the # of unique su_ids - 793
+#length(unique(actigraphy$su_id))
+
+#need to remove the extra su_ids 
+del.list<-c("10003091", "10004581", "10005091", "10007281", "10007850", "10009211",
+              "10009851", "10010181", "10010651", "10011090", "10011131", "10011781",
+              "10012511", "10013171", "10013641", "10014481", "10014750", "10016641",
+              "10018210", "10019001", "10019471", "10020521", "10020931", "10022151",
+              "10022211", "10022481", "10023131", "10023521", "10024091", "10025091",
+              "10026231", "10026491", "10027611", "10028481", "10030090", "10030931",
+              "10032130", "10032951", "10033020", "10034201", "10035010", "10035081",
+              "10035181", "10036731", "10036781", "10037100", "10037791", "10039311",
+              "10039651", "10039951", "10040491", "10042131", "10042491", "10043641")
+  
+  
+#Remove these extra su_ids, create new dataset so don't edit original 
+sleepsample<- actigraphy[!actigraphy$su_id%in%del.list,]
+
+#check subsetting worked - 739
+#length(unique(sleepsample$su_id))
+
+#over 12,000,000 missing values in the original dataset
+#I originally recoded these to 0 but upon reflection, I think we should keep them so it doesn't skew any of the calculations
+#will just subset down to 72hr each and see how that affects the missingness
+
+#Remove su_ids without 3 nights of actigraphy as defined in W2 NSHAP file
+
+#filter out the actigraphs without three nights of data 
+sleepData <- read_dta("C:/Users/Jade/Documents/Sleep Mortality/sleepData.dta")
+#missing at least one night of actigraph data   
+missingAct <- sleepData %>% filter(is.na(sleepData$actigraph_sleep1) | is.na(sleepData$actigraph_sleep2) | is.na(sleepData$actigraph_sleep3) )
+m_act <- as.vector(unlist(missingAct["su_id"]))
+#remove these from the dataset
+sleepsample <- sleepsample[!sleepsample$su_id%in%m_act,]
+
+#check removing short actigraphy records worked - 689
+length(unique(sleepsample$su_id))
+
+
+#currently activity is measured in epochs (every 15 sec)
+#want to create MAXACT (maximum actigraphy count per minute)
+head(sleepsample)
+
+##Create MAXACT 
+  #create key to filter max values on by group
+  sleepsample$min <- format(sleepsample$datetime, "%Y-%m-%d %H:%M")
+  
+  #select only rows with max values per minute per subject
+  maxact_df <-sleepsample %>% 
+    group_by(su_id, min) %>%
+    slice(which.max(activity))
+  
+  
+  #probably only need su_id, datetime, activity (maybe interval_status and off_wrist_status)
+  #add logmax for later 
+  maxact_df <- maxact_df %>%
+    dplyr::select(su_id, datetime, min, activity, interval_status, off_wrist_status) %>%
+    rename(maxact = activity) %>%
+    mutate(logmax = log10(maxact + 1))
+  
+#view the data
+head(maxact_df)
+  
+#no more missing values and no time off wrist
+#looks like some high maxact values (we've already seen this outlier case that's causing that)
+summary(maxact_df)
+
+#subset all data to only include 72hr 
+act_72 <- maxact_df %>% 
+  group_by(su_id) %>% 
+  mutate(id = row_number())
+
+act_72 <- act_72[which(act_72$id <=4320), ]
+head(act_72)
+summary(act_72)
+
+#save for easy future use 
+#write.csv(act_72, "C:/Users/Jade/Documents/Sleep Mortality/act_72")
+
+```
+
+IS and IV require a more detailed data preparation, the above will be used in the cosine modeling. We need to calculate hourly mean actigraphy counts. 
+
+```{r data-prep-is-iv}
+##Create HRAVGS 
+
+#create key to filter average hourly values on su_id
+hravgs <- act_72 %>%
+  mutate(hr = format(datetime, "%Y-%m-%d %H"))
+
+#length(hravgs$su_id)
+
+#there may be hours with too little data to be meaningful
+#arbitrarily, if less than 10 min of data exclude it 
+hravgs <- hravgs %>% 
+  group_by(su_id, hr) %>% 
+  filter(n() >= 10)
+#length(hravgs$su_id) - does exclude ~1,500 obs 
+
+#mean maxact count for each hour 
+hravgs <- hravgs %>% 
+  group_by(su_id, hr) %>% 
+  summarize(hract = mean(maxact))
+#the warning just letting me know that I've grouped twice (which is what I want!)
+head(hravgs)
+
+#save for easy future use 
+#write.csv(hravgs, "C:/Users/Jade/Documents/Sleep Mortality/hr_avgs")
+
+
+```
+
+#Interday Stability Calculation
+
+We now have a dataset with hourly actigraphy averages (hract) for each of the su_ids of eligible sleep study respondents. Let's create the interday stability first. 
+
+```{r is}
+#if using the already prepared data, start here
+#hravgs <- read_csv("C:/Users/Jade/Documents/Sleep Mortality/hr_avgs")
+
+#Create data frame with IS values 
+IS_table <- data.table(su_id = unique(hravgs$su_id),
+                       n = 0,
+                       mean_m = 0,
+                       var_m = 0,
+                       is_denominator = 0,
+                       is_numerator = 0,
+                       Is= 0
+                       )
+p <- 24
+
+for (i in unique(hravgs$su_id)){
+  
+  #create subset for each su_id 
+  suid_sub <- subset(hravgs, hravgs$su_id == i)
+  
+  #Even with the subsetting down to 4,320 minutes of data, there were still respondents with >72hr of data 
+  #I'm fixing it this way but we can think about if this is best approach and why problem is happening to begin with
+  suid_sub$num_hrs <- seq.int(nrow(suid_sub))
+  suid_sub <- subset(suid_sub, num_hrs <=72)
+  
+  #n - how many hours? (should all be less than 72)
+  n <- length(suid_sub$hract)
+  IS_table[su_id== i,2] <- n
+  
+  #mean of all hourly actigraph measures (Xbar)
+  mean_m <- mean(suid_sub$hract)
+  IS_table[su_id == i,3] <- mean_m
+  
+  #variance of hourly actigraph measures 
+  var_m <- var(suid_sub$hract)
+  IS_table[su_id == i,4] <- var_m
+  
+  ##IS
+  
+    #denominator
+    is_denom <- var_m * (n -1)*p
+    IS_table[su_id == i,5] <- is_denom
+  
+    #numerator
+  
+      #extract just the hours (without the day)
+      suid_sub$hrs <- stri_sub(suid_sub$hr, -2, -1)
+  
+      #match hours and calculate their means across the days (x_h)
+      suid_sub <- suid_sub %>% 
+        group_by(hrs) %>% 
+        summarize(hrm = mean(hract))
+  
+      #mean actigraphy values by hour (x_h) - mean of all the hourly values (xbar)
+      suid_sub$ns <- (suid_sub$hrm - mean_m)^2
+      is_num <- n*sum(suid_sub$ns)
+      IS_table[su_id == i,6] <- is_num
+
+  
+    #interday stability
+    i_s <- is_num/is_denom
+  
+    IS_table[su_id == i,7] <- i_s
+  
+  
+}
+
+IS_table %>% 
+  skimr::skim()
+
+summary(IS_table)
+
+
+```
+I'm subsetting this dataset twice to ensure <72hr of data. I'm not so confident about the second time that's included in this loop. Without it, there are many participants with hr counts over 72 but all of the respondents only have 4,320 minutes of data so perhaps we should keep it? 
+
+```{r IS_plots}
+
+#makes graphing easier
+plot_ISIV <- function(suid, mytitle){
+ 
+  plot_subset <-hravgs %>%
+  subset(su_id== suid) %>%
+  mutate(hrs = stri_sub(hr, -5, -1)) %>%
+  mutate(labelhr = stri_sub(hr, -2, -1) )
+
+plot_subset %>%
+  ggplot(aes(x = hrs,
+             y = hract)) +
+  geom_point() +
+  labs(title = mytitle,
+     y = "Average Hourly Activity Count", 
+     x = "Hours (day hr)"
+     ) +
+  scale_x_discrete(limits = plot_subset$hrs, breaks = plot_subset$hrs[seq(1, length(plot_subset$hrs), by = 6)])
+
+}
+#minimum IS (0.24)
+#SU_ID = 10037310
+plot_ISIV("10037310", "Minimum Interday Stability (0.24)")
+
+#Mean/Median IS (0.73)
+#SU_ID 	10005080
+plot_ISIV("10005080", "Mean/Median Interday Stability (0.73)")
+
+
+#Max IS (1.06) 
+#SU_ID 10004150
+plot_ISIV("10004150", "Maximum Interday Stability (1.06)")
+
+
+```
+
+
+
+#Intraday Variability 
+```{r iv}
+
+##Create dataframe with IV values 
+IV_table <- data.table(su_id = unique(hravgs$su_id),
+                       n = 0,
+                       mean_m = 0,
+                       var_m = 0,
+                       iv_denominator = 0,
+                       iv_numerator = 0, 
+                       IV = 0
+)
+p <- 24
+
+
+for (i in unique(hravgs$su_id)){
+  
+  #subset all su_ids
+  suid_sub <- subset(hravgs, hravgs$su_id== i)
+  
+  #total number of hours - segment to 72
+  #again, still not very confident about this step 
+  suid_sub$num_hrs <- seq.int(nrow(suid_sub))
+  suid_sub <- subset(suid_sub, num_hrs <=72)
+
+  #n - how many hours in the subset? AFTER subset
+  n <- length(suid_sub$hract)
+  IV_table[su_id == i,2] <- n
+  
+  #mean for all the hourly actigraph values
+  mean_m <- mean(suid_sub$hract)
+  IV_table[su_id == i,3] <- mean_m
+  
+  #variance for all the hourly actigraph values
+  var_m <- var(suid_sub$hract)
+  IV_table[su_id == i,4] <- var_m
+  
+  
+  ##IV
+    #denominator 
+    iv_denom <- var_m * (n-1)^2 
+    IV_table[su_id == i,5] <- iv_denom
+  
+    #numerator
+      #create lagged values (xi-1)
+      suid_sub$lag <- dplyr::lag(suid_sub$hract)
+  
+      #subtract lagged values from xi and square them
+      suid_sub$lagss <- (suid_sub$hract - suid_sub$lag)^2
+  
+      #sum the xi - xi-1 and multiply by n
+      iv_num <- n*sum(suid_sub$lagss[2:n])
+      IV_table[su_id == i,6] <- iv_num
+  
+      #intraday variability 
+      i_v <- iv_num/iv_denom
+      IV_table[su_id == i,7] <- i_v
+  
+  
+  
+}
+
+IV_table %>% 
+  skimr::skim()
+
+summary(IV_table)
+
+```
+
+```{r IV-plots}
+
+#minimum IV (0.261)
+#suid 10007110
+plot_ISIV("10007110", "Minimum Intraday Variability (0.261)")
+
+
+#Mean IV (0.80)
+#suid 	10001170 
+plot_ISIV("10001170", "Mean Intraday Variability (0.80)" )
+
+#Maximum IV (2.086)
+#suid 10009310 
+plot_ISIV("10009310", "Maximum Intraday Variability (2.09)")
+
+
+
+
+
+```
+
+```{r combine}
+IS_IV <- data.table(su_id = unique(hravgs$su_id),
+                    IS = IS_table$Is,
+                    IV = IV_table$IV)
+
+IS_IV %>% 
+  skimr::skim()
+
+#correlation between the two
+cor(IS_IV$IS, IS_IV$IV)
+
+IS_IV %>%
+  ggplot(aes(x = IS,
+             y = IV)) +
+  geom_point() +
+  labs(title = "Intraday Variability vs. Interday Stability",
+     y = "Intraday Variability", 
+     x = "Interday Stability"
+     ) 
+
+
+#write this to dta to use later and to send to Elena
+write.dta(IS_IV, "C:/Users/Jade/Documents/Sleep Mortality/IS_IV_72.dta" )
+```
