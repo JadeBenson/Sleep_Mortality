@@ -1,0 +1,392 @@
+---
+title: "Pseudo-F Statistic"
+author: "Jade Benson"
+date: "2/8/2021"
+output: pdf_document
+  pdf_document:
+    latex_engine: xelatex 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#set up necessary packages 
+library(tidyverse) #for all the dataset work
+library(tidymodels)
+library(here) #possibly for file paths
+library(foreign) #convert foreign files (stata)
+library(haven) #actually needed haven for older stata files 
+library(data.table) 
+library(stringi) #extract strings from datetime 
+library(ggplot2) #graphing
+library(minpack.lm) #contains nlsLM for nonlinear fitting
+library(lubridate) #handle the times
+
+```
+
+#Psudo F-Statistic 
+The intention behind this value is to capture the differences between people with more defined rest/wake patterns. The use of cosine models "smooths out" any day-to-day variations. The logistic transformation attempts to fit a more "square-shaped" wave to the activity patterns which is supposed to representative of more clearly defined circadian rhythms. This metric is the improvement of fit that a logistic cosine model has over just a normal cosine model (hence the F statistic). In order to calculate this, we fit cosine models to every individual and use those values to prime our fit of the anti-logistic cosine model. We then use the residual sum of squares (goodness of fit measurement) to compare the improvement. 
+
+##Cosine Model 
+The formula for the cosine model $c(t)$ is: 
+![](C:/Users/Jade/Documents/Sleep Mortality/cosine_function.png)
+Where: 
+$r(t)$ is the log of the maximum activity count per minute
+$t$ is time 
+$Mesor$ is the middle of the data (mean)
+$φ$ is the time of the day of the maximum modeled value of r (acrophase)
+
+In Marler's original paper, they state that you can use either linear or non linear least squares to fit the cosine model. The other papers have used LLS, this version uses both and will compare and constrast the model type on the resulting values. 
+
+
+##Anti-logistic transformed cosine curve
+I typically refer to this as "ALT" for ease
+
+![ALT formula](C:/Users/Jade/Documents/Sleep Mortality/ALS_formula.png)
+Where: 
+$\beta$ determines where the function rises more/less steeply than the cosine curve. Large values indicate a squarer wave -more pronounced differences between sleep and wake.
+$\alpha$ determines whether peaks are wider than troughs. Large alpha means troughs are wide and peaks are narrow (and vice versa) - longer periods of wake as opposed to sleep.  
+
+##Pseudo F-Statistic 
+This is just a goodness of fit measurement that compares the performance of the ALT model to the cosine model by taking their residual sum of squares (RSS) and creating an F-statistic. 
+
+![Pseudo-F formula](C:/Users/Jade/Documents/Sleep Mortality/psf_formula.png)
+Where: 
+$RSS_{cos}$ is the residual sum of squares from the cosine model
+$RSS_{alt}$ is the residual sum of squares from the anti-logistic-transformed cosine model
+$n$ is the number of actigraphy observations 
+
+
+#Data Preparation 
+
+The data preparation is identical to that of Interday Stability and Intraday Variability. I've included the code in the source code, but won't include it in the output since we've already seen it. The data includes only actigraphy participants with 3 nights of data, each respondent has a maximum of 4,380 min (72hr) of actigraphy data. Importantly, none of the missing values were re-coded to be zero.  
+
+```{r data-clean, include = FALSE}
+#read in the data 
+actigraphy <- read_dta("C:/Users/Jade/Documents/W2_Actigraphy/activity.dta")
+
+#check the # of unique su_ids - 793
+#length(unique(actigraphy$su_id))
+
+#need to remove the extra su_ids 
+del.list<-c("10003091", "10004581", "10005091", "10007281", "10007850", "10009211",
+              "10009851", "10010181", "10010651", "10011090", "10011131", "10011781",
+              "10012511", "10013171", "10013641", "10014481", "10014750", "10016641",
+              "10018210", "10019001", "10019471", "10020521", "10020931", "10022151",
+              "10022211", "10022481", "10023131", "10023521", "10024091", "10025091",
+              "10026231", "10026491", "10027611", "10028481", "10030090", "10030931",
+              "10032130", "10032951", "10033020", "10034201", "10035010", "10035081",
+              "10035181", "10036731", "10036781", "10037100", "10037791", "10039311",
+              "10039651", "10039951", "10040491", "10042131", "10042491", "10043641")
+  
+  
+#Remove these extra su_ids, create new dataset so don't edit original 
+sleepsample<- actigraphy[!actigraphy$su_id%in%del.list,]
+
+#check subsetting worked - 739
+#length(unique(sleepsample$su_id))
+
+#over 12,000,000 missing values in the original dataset
+#I originally recoded these to 0 but upon reflection, I think we should keep them so it doesn't skew any of the calculations
+#will just subset down to 72hr each and see how that affects the missingness
+
+#Remove su_ids without 3 nights of actigraphy as defined in W2 NSHAP file
+
+#filter out the actigraphs without three nights of data 
+sleepData <- read_dta("C:/Users/Jade/Documents/Sleep Mortality/sleepData.dta")
+#missing at least one night of actigraph data   
+missingAct <- sleepData %>% filter(is.na(sleepData$actigraph_sleep1) | is.na(sleepData$actigraph_sleep2) | is.na(sleepData$actigraph_sleep3) )
+m_act <- as.vector(unlist(missingAct["su_id"]))
+#remove these from the dataset
+sleepsample <- sleepsample[!sleepsample$su_id%in%m_act,]
+
+#check removing short actigraphy records worked - 689
+length(unique(sleepsample$su_id))
+
+
+#currently activity is measured in epochs (every 15 sec)
+#want to create MAXACT (maximum actigraphy count per minute)
+head(sleepsample)
+
+##Create MAXACT 
+  #create key to filter max values on by group
+  sleepsample$min <- format(sleepsample$datetime, "%Y-%m-%d %H:%M")
+  
+  #select only rows with max values per minute per subject
+  maxact_df <-sleepsample %>% 
+    group_by(su_id, min) %>%
+    slice(which.max(activity))
+  
+  
+  #probably only need su_id, datetime, activity (maybe interval_status and off_wrist_status)
+  #add logmax for later 
+  maxact_df <- maxact_df %>%
+    dplyr::select(su_id, datetime, min, activity, interval_status, off_wrist_status) %>%
+    rename(maxact = activity) %>%
+    mutate(logmax = log10(maxact + 1))
+  
+#view the data
+head(maxact_df)
+  
+#no more missing values and no time off wrist
+#looks like some high maxact values (we've already seen this outlier case that's causing that)
+summary(maxact_df)
+
+#subset all data to only include 72hr 
+act_72 <- maxact_df %>% 
+  group_by(su_id) %>% 
+  mutate(id = row_number())
+
+act_72 <- act_72[which(act_72$id <=4320), ]
+head(act_72)
+summary(act_72)
+
+#save for easy future use 
+#write.csv(act_72, "C:/Users/Jade/Documents/Sleep Mortality/act_72")
+
+```
+
+#Model Fitting and Measurement Calculation 
+After loading in the data, I will define a function that will allow for the fitting of both linear and non-linear models in the calculation of PsF. 
+
+```{r psf-func}
+#if using the already prepared data, start here
+#act_72 <- read_csv("C:/Users/Jade/Documents/Sleep Mortality/act_72")
+
+
+#Function to fit models (either lls or nls), pseudo F statistic, and save values to a table 
+
+psf_function <- function(actigraphy_df, psf_table, linear_bool){
+
+  
+  for (i in unique(actigraphy_df$su_id)){
+  
+    #this catches any error cases that need individual fitting
+    tryCatch({
+    
+      #create subset for each su_id
+      suid_sub <- subset(actigraphy_df, actigraphy_df$su_id == i)
+  
+      #this records the number of observations 
+      n <- length(suid_sub$id)
+      psf_table[su_id == i,2] <- n
+  
+      Time <- suid_sub$id
+      Logmax <- suid_sub$logmax
+  
+  
+      #COSINE MODEL
+      
+      
+  #COSINE MODEL
+  
+  #find starting estimates for the values, using logmax
+  cos_mesor <- mean(Logmax)
+  cos_amp <- (max(Logmax) - min(Logmax))/2
+  #cases where max occurs multiple times, arbitrarily pick the first one
+  cos_phi <- min(suid_sub[Logmax == max(Logmax), ]$id)
+  
+  #this is the linear least squares approach (linear_bool = TRUE)
+  if(linear_bool){
+    suid_sub$X <- cos_mesor + cos_amp*cos((Time-cos_phi)*2*pi/1440)
+    cosmodel <- lm(Logmax ~ X, data = suid_sub)
+    p_cosine <- fitted(cosmodel)
+  
+    #fitted mesor
+    psf_table[su_id == i,3] <- mean(p_cosine)
+  
+    #fitted amplitude
+    p_cos_amp <- (max(p_cosine) - min(p_cosine))/2
+    psf_table[su_id == i,4] <- p_cos_amp
+  
+    #fitted phi
+    p_cos_phi <- min(suid_sub[p_cosine == max(p_cosine),]$id)
+    psf_table[su_id == i,5] <- p_cos_phi
+    
+    
+  } else {
+    #fit the nonlinear version 
+    
+    ##Parameter restrictions/definitions
+    #cos_phi this seems to be causing problems for the NLS cosine model, I'm try n/3 as initial guess 
+    #bound mesor from 0 - 4 (above max logmax value so shouldn't happen)
+    #amplitude from 0 -2 (similar reasons), I've also divided it by 2 
+    #acrophase between 1 - n 
+  
+    cosmodel <- nlsLM(Logmax ~ mesor + amplitude*cos((Time-acrophase)*(2*pi/1440)), start = list(mesor = cos_mesor, amplitude = cos_amp/2, acrophase = n/3), control = list(maxiter = 500), lower = c(0, 0, 1), upper = c(4, 2, n))
+  
+    p_cosine <- fitted(cosmodel)
+  
+    #fitted mesor
+    psf_table[su_id == i,3] <- coefficients(cosmodel_nls)["mesor"]
+  
+    #fitted amplitude
+    p_cos_amp <- coefficients(cosmodel_nls)["amplitude"]
+    psf_table[su_id == i,4] <- p_cos_amp
+  
+    #fitted phi
+    p_cos_phi <- coefficients(cosmodel_nls)["acrophase"]
+    psf_table[su_id == i,5] <- p_cos_phi
+    
+  }
+  
+  #from either cosine model 
+  
+  #phi time (phi naught)
+  p_phi0 <- suid_sub[which(suid_sub$id == p_cos_phi), ]$min
+  #convert this into a decimal hour 
+  p_phi0 <- as.POSIXct(p_phi0, origin = '1970-01-01', tz = 'UTC')
+  p_phi0 <- ymd_hms(p_phi0)
+  c_phi0_dechr <- hour(p_phi0) + minute(p_phi0)/60
+  psf_table[su_id == i,6] <- c_phi0_dechr
+  
+  
+  #RSS for cosine model to be used in PsF
+  cos_RSS <- deviance(cosmodel)
+  psf_table[su_id == i,7] <- cos_RSS
+  
+  
+  
+  ## ANTI-LOGISTIC TRANSFORMED MODEL
+  #starting estimates from cosine model (minimum, phi, 2*amplitude)
+  #beta = 2 & alpha = 0
+  
+  #ALT uses the minimum from this cosine model as its starting guess
+  ming <- min(p_cosine)
+  
+  #constrained with the recommended bounds 
+  #min should be greater than or equal to 0, I'll set upper bound as 4 since the maximum logmax value is 3.3
+  #amplitude should be positive and probably less than 2 since the data should be bounded between 0 and 3.3
+  #although they recommend 2* amplitude, I'm just going to make it amplitude since fitting nls to begin with
+  #beta is also supposed to be greater than 0 so I'll set upper bound at 750 since last time max beta was 700?
+  #phi has to be between 1 and the maximum length (n) 
+  #alpha has to be between -1 and 1 
+  
+  
+  fmodel <- nlsLM(Logmax ~ min + amp*((exp(beta*(cos((Time-phi)*(2*pi/1440)) - alpha)))/ (1 + exp(beta*(cos((Time-phi)*(2*pi/1440)) - alpha)))) , start = list(min = ming, amp = 2*p_cos_amp, beta = 2, phi = p_cos_phi, alpha = 0), control = list(maxiter = 500), lower = c(0, 0, 0, 1, -1), upper = c(4, 2, 750, n, 1))
+
+  alt_amp <- coefficients(fmodel)["amp"]
+  psf_table[su_id == i,8] <- alt_amp
+  
+  alt_phi <- coefficients(fmodel)["phi"]
+  psf_table[su_id == i,9] <- alt_phi
+
+  #phi naught
+  p_alt_phi0 <- suid_sub[which(suid_sub$id == round(alt_phi,0)), ]$min
+  #convert to decimal hr
+  alt_phi0 <- as.POSIXct(p_alt_phi0, origin = '1970-01-01', tz = 'UTC')
+  alt_phi0 <- ymd_hms(alt_phi0)
+  alt_phi0_dechr <- hour(alt_phi0) + minute(alt_phi0)/60
+  psf_table[su_id == i,10] <- alt_phi0_dechr
+  
+  alt_min <- coefficients(fmodel)["min"]
+  psf_table[su_id == i,11] <- alt_min
+  
+  alt_beta <- coefficients(fmodel)["beta"]
+  psf_table[su_id == i,12] <- alt_beta
+  
+  alt_alpha <- coefficients(fmodel)["alpha"]
+  psf_table[su_id == i,13] <- alt_alpha
+  
+  
+  #ALT RSS
+  alt_RSS <- deviance(fmodel)
+  psf_table[su_id == i,14] <- alt_RSS
+  
+  #Pseudo F statistic
+  PSF <- ((cos_RSS - alt_RSS)/2)/(alt_RSS/(n-5))
+  psf_table[su_id == i,15] <- PSF
+  
+  }, error=function(e){cat("ERROR :", conditionMessage(e), " su_id that generated error was: ", i, "\n")})
+}
+return(psf_table)
+}
+
+
+```
+
+```{r lin-PSF}
+
+#blank table
+linear_psf_table <- data.table(su_id = unique(act_72$su_id),
+                           n = 0,
+                           cos_mesor = 0,
+                           cos_amp = 0,
+                           cos_phi = 0,
+                           cos_phi0 = 0,
+                           cos_RSS = 0,
+                           alt_amp = 0,
+                           alt_phi = 0,
+                           alt_phi0 = 0,
+                           alt_min = 0,
+                           alt_beta = 0,
+                           alt_alpha = 0,
+                           alt_RSS = 0,
+                           PSF = 0
+)
+
+#linear approach
+linear_psf_table <- psf_function(act_72, psf_table = linear_psf_table, TRUE)
+#only one error: "10039690" to manually add to table 
+
+#add this to the data table 
+
+#do this again for the NLS 
+
+#send to Elena to re-do analysis
+
+
+
+write.csv(my_psf_table, "C:/Users/Jade/Documents/Sleep Mortality/psf_72")
+
+#write dta for Elena
+write_dta(my_psf_table, "C:/Users/Jade/Documents/Sleep Mortality/psf_72.dta")
+
+psf_dta_check <- read_dta("C:/Users/Jade/Documents/Sleep Mortality/psf_72.dta")
+
+
+
+
+```
+
+
+
+```{r vis}
+
+#basic visualizations
+boxplot(my_psf_table$PSF, data = my_psf_table, main = "Pseudo F Statistic Values" )
+boxplot(my_psf_table$PSF)
+hist(my_psf_table$PSF)
+
+
+##Try to melt the data by subsetting into the variables I want to compare 
+
+#alpha dataset
+amp_data <- subset(my_psf_table, select = c(su_id, cos_amp, alt_amp))
+view(amp_data)
+
+#attempt to melt? 
+amp_melt <- melt(data = amp_data, id.vars = c("su_id"), measure.vars = c("cos_amp", "alt_amp"))
+view(amp_melt)
+
+ggplot(amp_melt, aes(x= variable, y=value, color = variable)) + geom_violin() + labs(x = "Model Type", y = "Amplitude")
+
+#Acrophase in decimal hours past midnight
+acrophase_data <- subset(my_psf_table, select = c(su_id, cos_phi0_dechr, alt_phi0_dechr))
+view(acrophase_data)
+acrophase_melt <- melt(data = acrophase_data, id.vars = c("su_id"), measure.vars = c("cos_phi0_dechr", "alt_phi0_dechr"))
+view(acrophase_melt)
+ggplot(acrophase_melt, aes(x= variable, y=value, color = variable)) + geom_violin() + labs(x = "Model Type", y = "Acrophase in Decimal Hours") 
+
+
+
+#RSS 
+RSS_data <- subset(my_psf_table, select = c(su_id, cos_RSS, alt_RSS))
+view(RSS_data)
+RSS_melt <- melt(data = RSS_data, id.vars = c("su_id"), measure.vars = c("cos_RSS", "alt_RSS"))
+view(RSS_melt)
+ggplot(RSS_melt, aes(x= variable, y=value, color = variable)) + geom_violin() + labs(x = "Model Type", y = "Residual Sum of Squares") 
+
+
+
+```
